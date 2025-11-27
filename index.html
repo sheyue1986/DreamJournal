@@ -1,0 +1,1299 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { RefreshCcw, Download, Printer, Wand2, Loader2, Volume2, VolumeX, Sliders, X, Move } from 'lucide-react';
+
+// API Configuration
+const apiKey = "";
+const textToImageApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=${apiKey}`;
+const imageToImageApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent?key=${apiKey}`;
+
+// --- 3D Dream Particle Viewer (Three.js) ---
+const DreamParticleViewer = ({ imageUrl, params }) => {
+    const mountRef = useRef(null);
+    const sceneRef = useRef({});
+    const fadeInRef = useRef(0); // 用於漸入效果
+    
+    useEffect(() => {
+        if (!mountRef.current || !imageUrl) return;
+
+        // 1. Init Scene
+        const scene = new THREE.Scene();
+        scene.background = null; // Transparent background
+        
+        const width = mountRef.current.clientWidth;
+        const height = mountRef.current.clientHeight;
+
+        // 調整相機位置和 FOV，使圖像更大、更飽滿
+        const camera = new THREE.PerspectiveCamera(75, width / height, 1, 10000);
+        camera.position.set(0, 0, 180); // 拉近相機
+
+        const renderer = new THREE.WebGLRenderer({ 
+            antialias: false, 
+            powerPreference: "high-performance",
+            alpha: true 
+        });
+        renderer.setSize(width, height);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        mountRef.current.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.rotateSpeed = 0.2; // 降低手动旋转速度
+        controls.autoRotate = true;
+        // Fix: 大幅降低自动旋转速度，防止太快晕眩
+        controls.autoRotateSpeed = 0.05; 
+        controls.maxDistance = 800;
+        controls.minDistance = 50;
+
+        // Post-processing
+        const renderScene = new RenderPass(scene, camera);
+        const bloomPass = new UnrealBloomPass(new THREE.Vector2(width, height), 1.5, 0.4, 0.85);
+        
+        // Fix: 提高阈值，降低强度，防止白茫茫一片
+        bloomPass.threshold = 0.5; // 只有较亮的部分才发光，保留暗部细节
+        bloomPass.strength = 0.2;   // 降低初始 Bloom 强度
+        bloomPass.radius = 0.5;
+
+        const composer = new EffectComposer(renderer);
+        composer.addPass(renderScene);
+        composer.addPass(bloomPass);
+
+        sceneRef.current = { scene, camera, renderer, composer, controls, bloomPass, clock: new THREE.Clock() };
+        fadeInRef.current = 0; // 重置漸入進度
+
+        // 2. Load Texture & Create Particles
+        const loader = new THREE.TextureLoader();
+        loader.crossOrigin = "Anonymous";
+        
+        loader.load(imageUrl, (texture) => {
+            if (sceneRef.current.mesh) {
+                scene.remove(sceneRef.current.mesh);
+                sceneRef.current.mesh.geometry.dispose();
+                sceneRef.current.mesh.material.dispose();
+            }
+
+            const imgWidth = texture.image.width;
+            const imgHeight = texture.image.height;
+            const aspect = imgWidth / imgHeight;
+            
+            // 增加平面幾何體的尺寸
+            const geometry = new THREE.PlaneGeometry(240 * aspect, 240, params.particleCount, params.particleCount);
+            
+            const uniforms = {
+                uTexture: { value: texture },
+                uTime: { value: 0 },
+                uDepth: { value: params.depthStrength },
+                uSize: { value: params.pointSize },
+                uSpeed: { value: params.flowSpeed },
+                uNoiseScale: { value: params.noiseScale },
+                uOpacity: { value: 0.0 }, // 新增透明度 uniform，用於漸入
+            };
+
+            const vertexShader = `
+                uniform sampler2D uTexture;
+                uniform float uTime;
+                uniform float uDepth;
+                uniform float uSize;
+                uniform float uSpeed;
+                uniform float uNoiseScale;
+                uniform float uOpacity;
+                
+                varying vec3 vColor;
+                varying float vAlpha;
+
+                float random(vec2 st) {
+                    return fract(sin(dot(st.xy, vec2(12.9898,78.233))) * 43758.5453123);
+                }
+
+                float noise(vec2 st) {
+                    vec2 i = floor(st);
+                    vec2 f = fract(st);
+                    float a = random(i);
+                    float b = random(i + vec2(1.0, 0.0));
+                    float c = random(i + vec2(0.0, 1.0));
+                    float d = random(i + vec2(1.0, 1.0));
+                    vec2 u = f * f * (3.0 - 2.0 * f);
+                    return mix(a, b, u.x) + (c - a)* u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+                }
+
+                void main() {
+                    vec2 uv = uv;
+                    vec4 color = texture2D(uTexture, uv);
+                    
+                    float brightness = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+                    
+                    vec3 pos = position;
+                    pos.z += brightness * uDepth;
+
+                    // 不规则流动逻辑：增强噪声的复杂度和不规则性
+                    float t = uTime * uSpeed * 0.1;
+                    float noise1 = noise(uv * uNoiseScale + t);
+                    float noise2 = noise(uv * uNoiseScale * 2.0 - t); // 反向噪声叠加
+                    
+                    float angle = noise1 * 3.14159 * 4.0;
+                    float flowIntensity = brightness * 3.0 * noise2; // 基于亮度和噪声的流动强度
+                    
+                    pos.x += cos(angle) * flowIntensity; 
+                    pos.y += sin(angle) * flowIntensity;
+                    pos.z += sin(t * 2.0 + uv.y * 5.0) * 5.0 * brightness; // Z轴呼吸
+
+                    // 在漸入過程中縮放粒子大小
+                    float pSize = uSize * (0.5 + brightness * 2.5) * smoothstep(0.0, 1.0, uOpacity);
+                    
+                    vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                    gl_Position = projectionMatrix * mvPosition;
+                    
+                    gl_PointSize = pSize * (300.0 / -mvPosition.z);
+                    
+                    vColor = color.rgb;
+                    vAlpha = color.a * uOpacity; // 應用漸入透明度
+                }
+            `;
+
+            const fragmentShader = `
+                varying vec3 vColor;
+                varying float vAlpha;
+                
+                void main() {
+                    vec2 coord = gl_PointCoord - vec2(0.5);
+                    if(length(coord) > 0.5) discard;
+                    
+                    float strength = 1.0 - length(coord) * 2.0;
+                    strength = pow(strength, 2.0);
+                    
+                    gl_FragColor = vec4(vColor, vAlpha * strength);
+                }
+            `;
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: uniforms,
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+            });
+
+            const mesh = new THREE.Points(geometry, material);
+            scene.add(mesh);
+            sceneRef.current.mesh = mesh;
+            sceneRef.current.uniforms = uniforms;
+        });
+
+        // 3. Animation Loop
+        const animate = () => {
+            if (!mountRef.current) return;
+            requestAnimationFrame(animate);
+            
+            const { clock, uniforms, controls, composer } = sceneRef.current;
+            if (clock && uniforms) {
+                uniforms.uTime.value = clock.getElapsedTime();
+
+                // 漸入效果：逐漸增加透明度
+                if (fadeInRef.current < 1.0) {
+                    fadeInRef.current += 0.008; // 稍微調慢漸入速度，使其更平滑
+                    uniforms.uOpacity.value = Math.min(fadeInRef.current, 1.0);
+                }
+            }
+            if (controls) controls.update();
+            if (composer) composer.render();
+        };
+        animate();
+
+        const handleResize = () => {
+            if (!mountRef.current) return;
+            const w = mountRef.current.clientWidth;
+            const h = mountRef.current.clientHeight;
+            const { camera, renderer, composer } = sceneRef.current;
+            if (camera && renderer && composer) {
+                camera.aspect = w / h;
+                camera.updateProjectionMatrix();
+                renderer.setSize(w, h);
+                composer.setSize(w, h);
+            }
+        };
+        window.addEventListener('resize', handleResize);
+
+        return () => {
+            window.removeEventListener('resize', handleResize);
+            if (mountRef.current && sceneRef.current.renderer) {
+                mountRef.current.removeChild(sceneRef.current.renderer.domElement);
+                sceneRef.current.renderer.dispose();
+            }
+        };
+    }, [imageUrl, params.particleCount]);
+
+    useEffect(() => {
+        const { uniforms, bloomPass } = sceneRef.current;
+        if (uniforms) {
+            uniforms.uDepth.value = params.depthStrength;
+            uniforms.uSize.value = params.pointSize;
+            uniforms.uSpeed.value = params.flowSpeed;
+            uniforms.uNoiseScale.value = params.noiseScale;
+        }
+        if (bloomPass) {
+            bloomPass.strength = params.bloomStrength;
+        }
+    }, [params]);
+
+    return <div ref={mountRef} className="w-full h-full absolute inset-0 z-20" />;
+};
+
+// --- 音频生成钩子：星际大教堂引擎 ---
+const useCinematicSound = () => {
+    const audioContextRef = useRef(null);
+    const masterGainRef = useRef(null);
+    const schedulerRef = useRef(null);
+    const intensityRef = useRef(0.2); 
+    const [isMuted, setIsMuted] = useState(true);
+    const [isInitialized, setIsInitialized] = useState(false);
+
+    const createSpaceReverb = (ctx) => {
+        const length = ctx.sampleRate * 8; 
+        const decay = 8.0;
+        const buffer = ctx.createBuffer(2, length, ctx.sampleRate);
+        for (let channel = 0; channel < 2; channel++) {
+            const channelData = buffer.getChannelData(channel);
+            let lastOut = 0;
+            for (let i = 0; i < length; i++) {
+                const white = Math.random() * 2 - 1;
+                const smooth = (lastOut + white) * 0.5;
+                lastOut = smooth;
+                channelData[i] = smooth * Math.pow(1 - i / length, decay) * 0.8;
+            }
+        }
+        return buffer;
+    };
+
+    const rampIntensity = useCallback((target, duration) => {
+        if (!audioContextRef.current) return;
+        const now = performance.now();
+        const startValue = intensityRef.current;
+        const startTime = now;
+
+        const update = () => {
+            const currentTime = performance.now();
+            const elapsed = (currentTime - startTime) / 1000; 
+            if (elapsed >= duration) {
+                intensityRef.current = target;
+                return; 
+            }
+            const t = elapsed / duration;
+            const ease = t < .5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+            intensityRef.current = startValue + (target - startValue) * ease;
+            requestAnimationFrame(update);
+        };
+        update();
+    }, []);
+
+    const initAudio = useCallback(() => {
+        if (audioContextRef.current) return;
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AudioContext();
+        audioContextRef.current = ctx;
+
+        const masterGain = ctx.createGain();
+        masterGain.gain.value = 0;
+        masterGain.connect(ctx.destination);
+        masterGainRef.current = masterGain;
+
+        const convolver = ctx.createConvolver();
+        convolver.buffer = createSpaceReverb(ctx);
+        const reverbGain = ctx.createGain();
+        reverbGain.gain.value = 1.2; 
+        
+        const compressor = ctx.createDynamicsCompressor();
+        compressor.threshold.value = -10;
+        compressor.ratio.value = 20; 
+        compressor.attack.value = 0.01;
+        compressor.release.value = 0.2;
+
+        const masterFilter = ctx.createBiquadFilter();
+        masterFilter.type = 'lowpass';
+        masterFilter.frequency.value = 3000; 
+
+        masterGain.connect(masterFilter);
+        masterFilter.connect(compressor);
+        compressor.connect(ctx.destination);
+        masterFilter.connect(convolver);
+        convolver.connect(reverbGain);
+        reverbGain.connect(compressor);
+
+        const playOrganChord = (frequencies, time, duration) => {
+            if (!frequencies) return; 
+            const currentIntensity = intensityRef.current;
+            frequencies.forEach((freq) => {
+                const layers = [
+                    { mult: 0.5, vol: 0.7, minInt: 0 }, 
+                    { mult: 1.0, vol: 0.5, minInt: 0 },
+                    { mult: 1.5, vol: 0.3, minInt: 0.3 },
+                    { mult: 2.0, vol: 0.25, minInt: 0.6 },
+                    { mult: 4.0, vol: 0.15, minInt: 0.85 } 
+                ];
+                layers.forEach(layer => {
+                    if (currentIntensity < layer.minInt) return;
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.type = 'sine'; 
+                    osc.frequency.value = freq * layer.mult;
+                    osc.detune.value = (Math.random() - 0.5) * 4; 
+                    gain.gain.setValueAtTime(0, time);
+                    let finalVol = layer.vol * (0.2 + currentIntensity * 0.8);
+                    gain.gain.linearRampToValueAtTime(finalVol, time + 3.0); 
+                    gain.gain.setValueAtTime(finalVol, time + duration - 3.0);
+                    gain.gain.linearRampToValueAtTime(0, time + duration); 
+                    osc.connect(gain);
+                    gain.connect(masterGain); 
+                    osc.start(time);
+                    osc.stop(time + duration);
+                });
+            });
+        };
+
+        const playCrystalPulse = (freq, time) => {
+            const currentIntensity = intensityRef.current;
+            if (currentIntensity < 0.15) return;
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine'; 
+            osc.frequency.value = freq * 2; 
+            const filter = ctx.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.frequency.value = 800 + (currentIntensity * 2000); 
+            filter.Q.value = 0.5;
+            gain.gain.setValueAtTime(0, time);
+            gain.gain.linearRampToValueAtTime(0.1 * currentIntensity, time + 0.05); 
+            gain.gain.exponentialRampToValueAtTime(0.001, time + 0.8); 
+            osc.connect(filter);
+            filter.connect(gain);
+            gain.connect(masterGain); 
+            osc.start(time);
+            osc.stop(time + 1.0);
+        };
+
+        const CHORDS = {
+            Am: [55.00, 110.00, 164.81], 
+            F:  [43.65, 87.31, 130.81], 
+            C:  [65.41, 130.81, 196.00], 
+            G:  [49.00, 98.00, 146.83], 
+        };
+        const PROGRESSION_MAP = {
+            Am: ['F', 'C'],
+            F:  ['C', 'Am'],
+            C:  ['Am', 'G'],
+            G:  ['Am', 'C'],
+        };
+        let nextChordTime = ctx.currentTime;
+        let currentChordName = 'Am'; 
+
+        const schedule = () => {
+            if (ctx.state === 'closed') return;
+            const now = ctx.currentTime;
+            while (nextChordTime < now + 0.2) {
+                const duration = 8.0; 
+                const currentIntensity = intensityRef.current;
+                const possibleNextChords = PROGRESSION_MAP[currentChordName] || ['Am'];
+                currentChordName = possibleNextChords[Math.floor(Math.random() * possibleNextChords.length)];
+                const currentChordFreqs = CHORDS[currentChordName];
+                playOrganChord(currentChordFreqs, nextChordTime, duration + 3.0);
+                const noteDivision = currentIntensity > 0.8 ? 0.125 : 0.25; 
+                const notesCount = Math.floor(duration / noteDivision);
+                const arpPattern = [0, 1, 2, 1]; 
+                for (let i = 0; i < notesCount; i++) {
+                    const noteTime = nextChordTime + i * noteDivision;
+                    if (currentChordFreqs) {
+                        if (Math.random() < (0.3 + currentIntensity * 0.7)) {
+                            const noteIndex = arpPattern[i % 4];
+                            const baseNote = currentChordFreqs[noteIndex];
+                            playCrystalPulse(baseNote, noteTime);
+                        }
+                    }
+                }
+                nextChordTime += duration; 
+            }
+            schedulerRef.current = requestAnimationFrame(schedule);
+        };
+        schedule();
+        setIsInitialized(true);
+    }, [rampIntensity]);
+
+    const toggleMute = useCallback(() => {
+        if (!isInitialized) {
+            initAudio();
+            setIsMuted(false);
+            if (audioContextRef.current && masterGainRef.current) {
+                audioContextRef.current.resume();
+                masterGainRef.current.gain.setTargetAtTime(1.0, audioContextRef.current.currentTime, 8); 
+            }
+        } else {
+            if (audioContextRef.current) {
+                if (isMuted) {
+                    audioContextRef.current.resume();
+                    masterGainRef.current.gain.setTargetAtTime(1.0, audioContextRef.current.currentTime, 4);
+                } else {
+                    masterGainRef.current.gain.setTargetAtTime(0, audioContextRef.current.currentTime, 1);
+                }
+                setIsMuted(!isMuted);
+            }
+        }
+    }, [isInitialized, isMuted, initAudio]);
+
+    useEffect(() => {
+        return () => {
+            if (schedulerRef.current) cancelAnimationFrame(schedulerRef.current);
+            if (audioContextRef.current) audioContextRef.current.close();
+        };
+    }, []);
+
+    return { isMuted, toggleMute, rampIntensity };
+};
+
+// --- 音量控制组件 ---
+const SoundController = ({ isMuted, toggleMute }) => (
+    <button 
+        onClick={(e) => { e.stopPropagation(); toggleMute(); }}
+        className="absolute top-6 left-6 z-50 p-2 text-white/30 hover:text-white hover:bg-white/10 rounded-full transition-all duration-500"
+        title={isMuted ? "連接星際信號" : "中斷信號"}
+    >
+        {isMuted ? <VolumeX size={20} /> : <Volume2 size={20} className="animate-pulse" />}
+    </button>
+);
+
+// --- 高性能粒子组件 (背景用 - 样式统一化 & 优化遮挡) ---
+const BackgroundParticleCanvas = React.memo(({ dimBackground }) => {
+    const canvasRef = useRef(null);
+    const particles = useRef([]);
+    const animationFrameId = useRef(null);
+    
+    // 减少粒子数量，使其更稀疏，不抢眼
+    const particleCount = 800; 
+    // 统一色彩：青色、白色、深蓝，去除了杂乱颜色
+    const particleColors = ['#00ffff', '#ffffff', '#0088ff', '#0033aa', '#88ccff'];
+
+    const initializeParticles = (width, height) => {
+        particles.current = [];
+        for (let i = 0; i < particleCount; i++) {
+            particles.current.push({
+                x: Math.random() * width,
+                y: Math.random() * height,
+                z: Math.random() * 2,
+                color: particleColors[Math.floor(Math.random() * particleColors.length)],
+                vx: (Math.random() - 0.5) * 0.5, 
+                vy: (Math.random() - 0.5) * 0.5,
+                phase: Math.random() * Math.PI * 2,
+                noiseOffset: Math.random() * 100,
+                // 减小基础尺寸，使其成为细腻的背景
+                baseSizeFactor: 0.3 + Math.random() * 0.4
+            });
+        }
+    };
+    
+    const draw = useCallback((ctx, width, height) => {
+        const time = Date.now() * 0.001;
+
+        ctx.globalCompositeOperation = 'destination-out';
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.1)'; 
+        ctx.fillRect(0, 0, width, height);
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalCompositeOperation = 'lighter';
+
+        // 大幅降低不透明度，确保文字清晰
+        const globalOpacityMultiplier = dimBackground ? 0.05 : 0.2;
+
+        particles.current.forEach(p => {
+            p.x += p.vx;
+            p.y += p.vy;
+
+            if (p.x < 0) p.x = width;
+            if (p.x > width) p.x = 0;
+            if (p.y < 0) p.y = height;
+            if (p.y > height) p.y = 0;
+
+            p.z = (p.z + 0.005) % 2;
+
+            const size = (0.5 + (2 - p.z) * 0.5) * p.baseSizeFactor;
+            
+            ctx.fillStyle = p.color;
+            ctx.globalAlpha = (0.3 + (2 - p.z) * 0.4) * globalOpacityMultiplier; 
+            
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, size, 0, Math.PI * 2);
+            
+            // 只有非常大的粒子才有一点点辉光，背景不需要太多 Bloom
+            if (!dimBackground && size > 2.0) {
+                ctx.shadowBlur = size * 2;
+                ctx.shadowColor = p.color;
+            } else {
+                ctx.shadowBlur = 0;
+            }
+            ctx.fill();
+        });
+        
+        animationFrameId.current = requestAnimationFrame(() => draw(ctx, width, height));
+    }, [dimBackground]);
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        const ctx = canvas.getContext('2d');
+        const handleResize = () => {
+            if (canvas) {
+                canvas.width = canvas.offsetWidth;
+                canvas.height = canvas.offsetHeight;
+                initializeParticles(canvas.width, canvas.height);
+            }
+        };
+        handleResize();
+        window.addEventListener('resize', handleResize);
+        animationFrameId.current = requestAnimationFrame(() => draw(ctx, canvas.width, canvas.height));
+        return () => {
+            window.removeEventListener('resize', handleResize);
+            cancelAnimationFrame(animationFrameId.current);
+        };
+    }, [draw]); 
+
+    return <canvas ref={canvasRef} className="absolute inset-0 w-full h-full z-0 pointer-events-none" />;
+});
+
+// --- 滑块控制组件 (样式微调) ---
+const ControlSlider = ({ label, value, min, max, step = 1, onChange }) => (
+  <div className="space-y-1 font-mono select-none">
+    <div className="flex justify-between text-[10px] text-cyan-100/60 tracking-widest">
+      <span>{label}</span>
+      <span>{value}</span>
+    </div>
+    <input 
+      type="range" min={min} max={max} step={step} value={value}
+      onChange={(e) => onChange(parseFloat(e.target.value))}
+      className="w-full h-1 bg-white/10 rounded-none appearance-none cursor-pointer outline-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-2 [&::-webkit-slider-thumb]:h-2 [&::-webkit-slider-thumb]:bg-cyan-400 hover:[&::-webkit-slider-thumb]:bg-white transition-all"
+    />
+  </div>
+);
+
+// --- Draggable Panel Helper ---
+const DraggablePanel = ({ children, show }) => {
+    const [position, setPosition] = useState({ x: 0, y: 0 }); // Initial offset
+    const isDragging = useRef(false);
+    const dragStartPos = useRef({ x: 0, y: 0 });
+    const panelRef = useRef(null);
+
+    const handleMouseDown = (e) => {
+        // Only drag when clicking the header area (top part of the panel)
+        // or if we want the whole panel draggable, but avoid sliders.
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON') return;
+        
+        isDragging.current = true;
+        dragStartPos.current = {
+            x: e.clientX - position.x,
+            y: e.clientY - position.y
+        };
+        
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('mouseup', handleMouseUp);
+    };
+
+    const handleMouseMove = (e) => {
+        if (!isDragging.current) return;
+        const newX = e.clientX - dragStartPos.current.x;
+        const newY = e.clientY - dragStartPos.current.y;
+        setPosition({ x: newX, y: newY });
+    };
+
+    const handleMouseUp = () => {
+        isDragging.current = false;
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    return (
+        <div 
+            ref={panelRef}
+            onMouseDown={handleMouseDown}
+            className={`
+                absolute bottom-32 left-0 right-0 mx-auto w-64 
+                bg-black/20 border border-white/10 backdrop-blur-sm
+                transition-opacity duration-300 ease-out z-50 cursor-move
+                ${show ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}
+            `} 
+            style={{ 
+                padding: '15px', 
+                borderRadius: '2px',
+                transform: `translate(${position.x}px, ${position.y}px)`,
+                boxShadow: '0 4px 30px rgba(0, 0, 0, 0.1)'
+            }}
+        >
+            <div className="flex items-center justify-between border-b border-white/10 pb-2 mb-4 cursor-move">
+                <div className="text-[10px] text-cyan-500/80 tracking-[0.2em]">
+                    PARAMETER_CONTROL
+                </div>
+                <Move size={12} className="text-white/30" />
+            </div>
+            {children}
+        </div>
+    );
+};
+
+// --- 独立屏幕组件 ---
+const StartupScreen = ({ setGameState }) => {
+    const [textIndex, setTextIndex] = useState(0);
+    const [scaleY, setScaleY] = useState(1);
+    const [scaleX, setScaleX] = useState(1);
+    const [opacity, setOpacity] = useState(1);
+    const [whiteFlash, setWhiteFlash] = useState(0);
+
+    const POEM_COLLECTIONS = [
+        [ "昔者庄周梦为蝴蝶", "栩栩然蝴蝶也", "自喻适志与", "不知周也", "俄然觉", "则蘧蘧然周也" ],
+        [ "一切有为法", "如梦幻泡影", "如露亦如电", "应作如是观" ],
+        [ "世事一场大梦", "人生几度秋凉", "夜来风叶已鸣廊", "看取眉头鬓上" ],
+        [ "处世若大梦", "胡为劳其生", "所以终日醉", "颓然卧前楹" ],
+        [ "情不知所起", "一往而深", "梦中之情", "何必非真" ],
+        [ "醉后不知天在水", "满船清梦压星河", "梦里不知身是客", "一晌贪欢" ]
+    ];
+    
+    const [currentPoems] = useState(() => {
+        const randomIndex = Math.floor(Math.random() * POEM_COLLECTIONS.length);
+        return POEM_COLLECTIONS[randomIndex];
+    });
+
+    useEffect(() => {
+        const bootSequence = async () => {
+            for (let i = 0; i < currentPoems.length; i++) {
+                setTextIndex(i);
+                await new Promise(r => setTimeout(r, 1500)); 
+            }
+            setScaleY(0.005); await new Promise(r => setTimeout(r, 300));
+            setScaleX(0); setWhiteFlash(1); await new Promise(r => setTimeout(r, 200));
+            setWhiteFlash(0); setOpacity(0); await new Promise(r => setTimeout(r, 500)); 
+            setGameState('journal');
+        };
+        bootSequence();
+    }, [setGameState, currentPoems]);
+
+    return (
+        <div className="absolute inset-0 bg-black z-50 flex items-center justify-center overflow-hidden">
+            <style>{`
+                @import url('https://fonts.googleapis.com/css2?family=Ma+Shan+Zheng&display=swap');
+                .poem-font { font-family: 'Ma Shan Zheng', cursive; }
+            `}</style>
+            <div 
+                className="absolute inset-0 bg-black transition-transform duration-300 ease-out flex items-center justify-center"
+                style={{
+                    opacity: opacity,
+                    transform: `scale(${scaleX}, ${scaleY})`,
+                    transformOrigin: 'center',
+                }}
+            >
+                <div className="absolute inset-0 opacity-20 pointer-events-none"
+                     style={{
+                        backgroundImage: `repeating-conic-gradient(#000 0% 25%, #fff 0% 50%)`,
+                        backgroundSize: '4px 4px',
+                        filter: 'contrast(200%) brightness(150%)',
+                        animation: 'noise 0.2s infinite'
+                     }}
+                >
+                    <style>{`@keyframes noise { 0% { background-position: 0 0; } 100% { background-position: 10px 10px; } }`}</style>
+                </div>
+                <div className="relative z-10">
+                    <p className="text-[#e0d0b0] poem-font text-2xl md:text-3xl tracking-[0.2em] animate-pulse text-center px-8 leading-loose"
+                       style={{ textShadow: '0 0 10px rgba(224, 208, 176, 0.5)' }}>
+                        {currentPoems[textIndex]}
+                    </p>
+                </div>
+            </div>
+            <div 
+                className="absolute w-1 h-1 bg-white rounded-full shadow-[0_0_20px_white,0_0_40px_cyan]"
+                style={{ 
+                    opacity: whiteFlash,
+                    transition: 'opacity 0.1s ease-out'
+                }}
+            ></div>
+        </div>
+    );
+};
+
+const JournalScreen = ({ dreamText, setDreamText, typedText, setTypedText, handleTextClick, isTextFlashing }) => {
+    const inputRef = useRef(null);
+    useEffect(() => { if (inputRef.current) inputRef.current.focus(); }, []);
+
+    return (
+        <div className="absolute inset-0 overflow-hidden bg-[#0a0805] cursor-text">
+            <style>{`
+                @import url('https://fonts.googleapis.com/css2?family=Ma+Shan+Zheng&display=swap');
+                .calligraphy-font { font-family: 'Ma Shan Zheng', cursive; }
+                
+                @keyframes textGlitch {
+                    0% { opacity: 1; text-shadow: 0 0 5px rgba(232, 220, 192, 0.3); color: #e8dcc0; }
+                    10% { opacity: 0.8; text-shadow: 0 0 20px rgba(0, 255, 255, 0.8); color: #fff; transform: skewX(5deg); }
+                    100% { opacity: 0; transform: scale(1.1); filter: blur(5px); }
+                }
+                @keyframes cursorEntry {
+                    0% { height: 4px; width: 4px; border-radius: 50%; opacity: 0; transform: scale(0.5); }
+                    50% { opacity: 1; transform: scale(1); }
+                    100% { height: 40px; width: 3px; border-radius: 0; }
+                }
+            `}</style>
+            
+            <div className="absolute inset-0 z-0 opacity-40 pointer-events-none" 
+                 style={{ 
+                     backgroundImage: `url("data:image/svg+xml,%3Csvg width='200' height='200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.4'/%3E%3C/svg%3E")`,
+                     filter: 'sepia(0.8) contrast(1.5) brightness(0.3)',
+                 }}
+            ></div>
+            <div className="absolute inset-0 pointer-events-none" style={{ background: 'radial-gradient(circle at center, rgba(255, 230, 200, 0.15) 0%, rgba(10, 8, 5, 0.8) 60%, #000 100%)' }}></div>
+
+            <div className="absolute inset-0 p-10 z-10 flex items-center justify-center">
+                <div 
+                    onClick={handleTextClick}
+                    className={`w-full max-w-md text-center transition-all duration-200 ${isTextFlashing ? 'pointer-events-none' : 'cursor-pointer'}`}
+                >
+                    <p className="text-4xl text-[#e0d0b0] calligraphy-font leading-relaxed whitespace-pre-wrap break-words" 
+                       style={{ 
+                           textShadow: '0 0 10px rgba(255, 230, 200, 0.5), 0 0 20px rgba(255, 230, 200, 0.2)',
+                           animation: isTextFlashing ? 'textGlitch 0.3s forwards' : 'none'
+                       }}>
+                        {typedText}
+                        {!isTextFlashing && (
+                            <span 
+                                className="inline-block bg-[#e0d0b0] ml-2 align-middle shadow-[0_0_8px_#e0d0b0]"
+                                style={{
+                                    width: '3px',
+                                    height: '40px',
+                                    animation: 'cursorEntry 0.8s ease-out forwards, pulse 1s infinite 0.8s'
+                                }}
+                            ></span>
+                        )}
+                    </p>
+                </div>
+                
+                <textarea 
+                    ref={inputRef}
+                    value={dreamText}
+                    onChange={(e) => {
+                        setDreamText(e.target.value);
+                        setTypedText(e.target.value);
+                    }}
+                    className="absolute inset-0 w-full h-full opacity-0 cursor-text resize-none z-20"
+                    disabled={isTextFlashing}
+                />
+            </div>
+            
+            {typedText.length > 0 && !isTextFlashing && (
+                <div 
+                    className="absolute bottom-20 left-0 right-0 flex justify-center z-50 cursor-pointer"
+                    onClick={(e) => {
+                        e.stopPropagation(); 
+                        handleTextClick();
+                    }}
+                >
+                    <div className="text-[#e0d0b0] opacity-60 hover:opacity-100 transition-opacity animate-pulse font-serif text-sm tracking-[0.3em] border-b border-[#e0d0b0] pb-1">
+                        [ 點擊文字入夢 ]
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+const AnimationScreen = ({ gameState, generatedImageUrl, dreamExplanation, resetState, saveDream }) => {
+    const [displayedExplanation, setDisplayedExplanation] = useState('');
+    const typingRef = useRef(null);
+    const [showControls, setShowControls] = useState(false);
+    
+    // 粒子调节参数
+    const [params, setParams] = useState({
+        particleCount: 200,
+        // Fix: 初始点大小改小，避免过曝和重叠
+        pointSize: 0.5, 
+        depthStrength: 100.0,
+        flowSpeed: 2.0,
+        noiseScale: 2.0,
+        // Fix: 初始 Bloom 强度大幅降低，避免白茫茫
+        bloomStrength: 1.1, 
+    });
+
+    useEffect(() => {
+        if (!dreamExplanation) {
+            setDisplayedExplanation('');
+            return;
+        }
+        if (displayedExplanation === dreamExplanation) return;
+
+        let currentIndex = 0;
+        setDisplayedExplanation('');
+        
+        if (typingRef.current) clearInterval(typingRef.current);
+        
+        typingRef.current = setInterval(() => {
+            if (currentIndex < dreamExplanation.length) {
+                setDisplayedExplanation(prev => dreamExplanation.substring(0, currentIndex + 1));
+                currentIndex++;
+            } else {
+                clearInterval(typingRef.current);
+                typingRef.current = null;
+            }
+        }, 30); 
+
+        return () => {
+            if (typingRef.current) clearInterval(typingRef.current);
+        };
+    }, [dreamExplanation]);
+
+    return (
+        <div className="absolute inset-0 bg-black overflow-hidden">
+            <style>{`
+                @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@300;500;700&display=swap');
+                @import url('https://fonts.googleapis.com/css2?family=Ma+Shan+Zheng&display=swap');
+                .serif-font { font-family: 'Noto Serif SC', serif; }
+                .calligraphy-font { font-family: 'Ma Shan Zheng', cursive; }
+                @keyframes pulse-image { 0%, 100% { transform: scale(1.0); filter: brightness(1.0) contrast(1.2); } 50% { transform: scale(1.05); filter: brightness(1.3) contrast(1.4); } }
+                @keyframes cursor-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+            `}</style>
+            
+            {/* Background 2D Particles (Optimized: Smaller, darker, unified color) */}
+            <BackgroundParticleCanvas dimBackground={!!generatedImageUrl} />
+
+            <div className="absolute inset-0 w-full h-full flex items-center justify-center">
+                
+                {/* Loading or Explanation State */}
+                {dreamExplanation && !generatedImageUrl && (
+                    <div className="absolute inset-0 flex items-center justify-center z-30 pointer-events-none px-8 bg-black/30 transition-colors duration-1000">
+                        <div className="max-w-lg text-left">
+                            <p className="text-xl md:text-2xl text-cyan-200 calligraphy-font leading-relaxed tracking-wider break-words"
+                               style={{ textShadow: '0 0 10px rgba(0, 255, 255, 0.7), 0 0 20px rgba(0, 100, 255, 0.5)' }}>
+                                <span className="text-cyan-500/80 text-sm block mb-4 tracking-[0.2em] w-fit">
+                                    &gt; SYSTEM_LOG_{Math.floor(Math.random() * 9000) + 1000} :: DEEP_SCAN_MODE
+                                </span>
+                                {displayedExplanation}
+                                <span className="inline-block w-2 h-4 bg-cyan-500/50 ml-1 align-middle" style={{ animation: 'cursor-blink 0.8s infinite steps(1)' }}></span>
+                            </p>
+                        </div>
+                    </div>
+                )}
+
+                {/* 3D Particle Viewer (Replaces Static Image) */}
+                {generatedImageUrl && (
+                    <div className={`absolute inset-0 w-full h-full z-20 transition-opacity duration-2000 ${gameState === 'result' ? 'opacity-100' : 'opacity-0'}`}>
+                        <DreamParticleViewer imageUrl={generatedImageUrl} params={params} />
+                        {/* Optional: subtle overlay vignette */}
+                        <div className="absolute inset-0 pointer-events-none" style={{ backgroundImage: 'radial-gradient(circle, transparent 40%, #000 120%)' }}></div>
+                        
+                        {/* 调节按钮 */}
+                        <button 
+                            onClick={() => setShowControls(!showControls)}
+                            className="absolute top-6 right-6 z-50 p-2 text-white/30 hover:text-white hover:bg-white/10 rounded-full transition-all duration-500"
+                            title="粒子调节"
+                        >
+                            {showControls ? <X size={20} /> : <Sliders size={20} />}
+                        </button>
+
+                        {/* 控制面板 (透明、可拖动) */}
+                        <DraggablePanel show={showControls}>
+                            <div className="space-y-4">
+                                <ControlSlider 
+                                    label="DENSITY" value={params.particleCount} 
+                                    min={50} max={300} step={10}
+                                    onChange={(v) => setParams(p => ({...p, particleCount: v}))}
+                                />
+                                <ControlSlider 
+                                    label="DEPTH" value={params.depthStrength} 
+                                    min={0} max={150} 
+                                    onChange={(v) => setParams(p => ({...p, depthStrength: v}))}
+                                />
+                                <ControlSlider 
+                                    label="FLOW" value={params.flowSpeed} 
+                                    min={0} max={2.0} step={0.1}
+                                    onChange={(v) => setParams(p => ({...p, flowSpeed: v}))}
+                                />
+                                <ControlSlider 
+                                    label="BLOOM" value={params.bloomStrength} 
+                                    min={0} max={3.0} step={0.1}
+                                    onChange={(v) => setParams(p => ({...p, bloomStrength: v}))}
+                                />
+                                <ControlSlider 
+                                    label="SIZE" value={params.pointSize} 
+                                    min={0.5} max={5.0} step={0.1}
+                                    onChange={(v) => setParams(p => ({...p, pointSize: v}))}
+                                />
+                            </div>
+                        </DraggablePanel>
+                    </div>
+                )}
+            </div>
+
+            <div className={`absolute bottom-10 w-full flex justify-center z-40 transition-all duration-700 ${gameState === 'result' ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-10 pointer-events-none'}`}>
+                <div className="flex gap-6">
+                    <button onClick={resetState} className="px-6 py-2 text-gray-500 hover:text-white border-b border-transparent hover:border-white transition font-serif tracking-widest text-xs">遺忘</button>
+                    <button onClick={saveDream} className="px-6 py-2 bg-white text-black hover:bg-gray-200 transition font-serif tracking-widest text-xs rounded-sm shadow-[0_0_15px_rgba(255,255,255,0.3)]">封存</button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const DarkroomScreen = ({ gallery, setGallery, setGameState, handleRealizePhoto }) => {
+    const [photos, setPhotos] = useState([]);
+    const containerRef = useRef(null);
+    const activeIdRef = useRef(null);
+    const dragOffsetRef = useRef({ x: 0, y: 0 });
+    const [developedMode, setDevelopedMode] = useState(false); 
+    const [loadingPhotoId, setLoadingPhotoId] = useState(null); 
+
+    useEffect(() => {
+        setPhotos(prevPhotos => {
+            const newPhotos = gallery.map(g => {
+                const existing = prevPhotos.find(p => p.id === g.id);
+                if (existing) return { ...g, x: existing.x, y: existing.y, r: existing.r, zIndex: existing.zIndex };
+                return { ...g, x: Math.random() * 60 - 30, y: Math.random() * 60 - 30, r: Math.random() * 30 - 15, zIndex: 1 };
+            });
+            return newPhotos;
+        });
+    }, [gallery]);
+
+    const onRealizeClick = async (photo) => {
+        if (loadingPhotoId) return; 
+        setLoadingPhotoId(photo.id);
+        try { await handleRealizePhoto(photo); } catch (error) { console.error("Realize failed", error); } finally { setLoadingPhotoId(null); }
+    };
+
+    const handleDragStart = (id, e) => {
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        activeIdRef.current = id;
+        setPhotos(prev => prev.map(p => ({ ...p, zIndex: p.id === id ? 100 : 1 })));
+        const photo = photos.find(p => p.id === id);
+        if (!photo || !containerRef.current) return;
+        const container = containerRef.current.getBoundingClientRect();
+        const currentPhotoX = container.width / 2 + photo.x;
+        const currentPhotoY = container.height / 2 + photo.y;
+        dragOffsetRef.current = { x: clientX - currentPhotoX, y: clientY - currentPhotoY };
+    };
+
+    const handleDragEnd = () => { activeIdRef.current = null; };
+
+    const handleMove = (e) => {
+        if (activeIdRef.current === null || !containerRef.current) return;
+        if (e.touches) e.preventDefault(); 
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        const container = containerRef.current.getBoundingClientRect();
+        
+        const newCenterX = clientX - dragOffsetRef.current.x;
+        const newCenterY = clientY - dragOffsetRef.current.y;
+        
+        const newX = newCenterX - container.width / 2;
+        const newY = newCenterY - container.height / 2;
+        
+        setPhotos(prev => prev.map(p => {
+            if (p.id === activeIdRef.current) return { ...p, x: newX, y: newY };
+            return p;
+        }));
+    };
+
+    // Add this missing function
+    const downloadPhoto = async (photo) => {
+        // 创建一个临时的 Canvas 用于合成图片
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        const scale = 3; // 导出 3 倍分辨率的高清图
+        
+        // 布局参数 (基于 UI: w-64(256px), p-2(8px), image h-60(240px), text h-16(64px))
+        const uiWidth = 256;
+        const uiPadding = 8;
+        const uiImageSize = 240; // 图片区域近似正方形
+        const uiTextHeight = 64;
+        const uiTotalHeight = uiPadding + uiImageSize + uiTextHeight + uiPadding;
+
+        canvas.width = uiWidth * scale;
+        canvas.height = uiTotalHeight * scale;
+
+        // 1. 绘制拍立得相纸背景 (白色)
+        ctx.fillStyle = '#fdfdfd';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // 2. 加载并绘制主图
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.src = photo.realImageUrl || photo.imageUrl;
+        
+        await new Promise((resolve) => {
+            img.onload = resolve;
+            img.onerror = resolve; // 即使失败也继续，避免卡死
+        });
+
+        // 保存状态，应用滤镜模拟 CSS 效果
+        ctx.save();
+        // 模拟 CSS: contrast-90 brightness-110 grayscale-[0.3] sepia-[0.6]
+        ctx.filter = 'contrast(0.9) brightness(1.1) grayscale(0.3) sepia(0.6)';
+        
+        const drawX = uiPadding * scale;
+        const drawY = uiPadding * scale;
+        const drawSize = uiImageSize * scale;
+        
+        // 计算 object-cover 效果
+        const srcRatio = img.width / img.height;
+        const dstRatio = 1; // 目标区域是正方形
+        let sWidth = img.width;
+        let sHeight = img.height;
+        let sx = 0;
+        let sy = 0;
+        
+        if (srcRatio > dstRatio) {
+            sWidth = img.height * dstRatio;
+            sx = (img.width - sWidth) / 2;
+        } else {
+            sHeight = img.width / dstRatio;
+            sy = (img.height - sHeight) / 2;
+        }
+
+        ctx.drawImage(img, sx, sy, sWidth, sHeight, drawX, drawY, drawSize, drawSize);
+        ctx.restore();
+
+        // 3. 绘制叠加层 (模拟 mix-blend-multiply 效果)
+        ctx.save();
+        ctx.fillStyle = 'rgba(138, 122, 106, 0.2)';
+        ctx.globalCompositeOperation = 'multiply';
+        ctx.fillRect(drawX, drawY, drawSize, drawSize);
+        ctx.restore();
+
+        // 4. 绘制时间戳 (右上角)
+        const timeX = (uiPadding + uiImageSize - 10) * scale; 
+        const timeY = (uiPadding + 20) * scale;
+        // 尝试使用自定义字体，如果未加载则回退到 monospace
+        ctx.font = `${18 * scale}px "VT323", monospace`;
+        ctx.fillStyle = 'rgba(138, 122, 106, 0.8)';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'top';
+        ctx.shadowColor = 'rgba(138, 122, 106, 0.5)';
+        ctx.shadowBlur = 2;
+        ctx.fillText(photo.timestamp, timeX, drawY + (10 * scale));
+
+        // 5. 绘制底部文字 (Text)
+        const textX = canvas.width / 2;
+        // 垂直居中于底部文本区域
+        const textY = (uiPadding + uiImageSize + uiTextHeight/2) * scale; 
+        ctx.font = `${14 * scale}px "Ma Shan Zheng", cursive`;
+        ctx.fillStyle = '#5a4a3a';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        // 限制文字最大宽度
+        const maxTextWidth = (uiWidth - 20) * scale;
+        
+        // 简单的文字截断逻辑 (如果太长)
+        let textToDraw = photo.text;
+        if (ctx.measureText(textToDraw).width > maxTextWidth) {
+             // 简单截断，实际项目可能需要更复杂的换行逻辑
+             const approxChars = Math.floor(maxTextWidth / (14 * scale));
+             textToDraw = textToDraw.substring(0, approxChars) + "...";
+        }
+        ctx.fillText(textToDraw, textX, textY);
+
+        // 6. 触发下载
+        const link = document.createElement('a');
+        link.download = `dream_memory_${photo.id}.png`;
+        link.href = canvas.toDataURL('image/png');
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    };
+
+    return (
+        <div className="absolute inset-0 bg-[#050505] overflow-hidden flex flex-col touch-none" onMouseMove={handleMove} onTouchMove={handleMove} onMouseUp={handleDragEnd} onTouchEnd={handleDragEnd}>
+            <style>{`
+                @import url('https://fonts.googleapis.com/css2?family=Ma+Shan+Zheng&display=swap');
+                @import url('https://fonts.googleapis.com/css2?family=VT323&display=swap');
+                .calligraphy-font { font-family: 'Ma Shan Zheng', cursive; }
+                .digital-font { font-family: 'VT323', monospace; }
+            `}</style>
+            
+            <div className="absolute top-0 left-0 w-full h-32 bg-gradient-to-b from-red-900/20 to-transparent z-10 pointer-events-none"></div>
+            
+            <div className="absolute top-6 right-6 z-50 flex gap-4">
+                <button onClick={() => setDevelopedMode(!developedMode)} className={`p-2 transition border rounded-full ${developedMode ? 'text-white border-white bg-white/10' : 'text-white/30 border-white/10 hover:text-white hover:border-white/50'}`} title="显影模式"><Printer size={20} /></button>
+                <button onClick={() => setGameState('startup')} className="p-2 text-red-400/50 hover:text-red-400 transition border border-red-900/30 rounded-full hover:bg-red-900/20" title="回到开端"><RefreshCcw size={20} /></button>
+            </div>
+
+            <div className="flex-1 relative w-full h-full" ref={containerRef}>
+                <p className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-red-900/10 font-serif text-5xl pointer-events-none select-none tracking-[0.2em]">DARK ROOM</p>
+                {photos.map((photo) => (
+                    <div key={photo.id} onMouseDown={(e) => handleDragStart(photo.id, e)} onTouchStart={(e) => handleDragStart(photo.id, e)}
+                        className={`absolute w-64 p-2 transition-all duration-1000 cursor-move ${developedMode ? 'bg-[#fdfdfd] shadow-[0_0_30px_rgba(0,0,0,0.2)]' : 'bg-[#1a1a1a] border border-[#333] shadow-[0_0_30px_rgba(100,0,255,0.15)]'}`}
+                        style={{ top: `calc(50% + ${photo.y}px)`, left: `calc(50% + ${photo.x}px)`, transform: `translate(-50%, -50%) rotate(${photo.r}deg) scale(${activeIdRef.current === photo.id ? 1.05 : 1.0})`, zIndex: photo.zIndex, borderRadius: '2px' }}>
+                        
+                        <div className="w-full h-60 bg-black overflow-hidden relative mb-0 group">
+                             <div className={`absolute inset-0 pointer-events-none z-10 transition-opacity duration-1000 ${developedMode ? 'opacity-40 mix-blend-overlay' : 'opacity-30'}`} style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg width='100' height='100' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.4'/%3E%3C/svg%3E")`, filter: developedMode ? 'sepia(0.8) contrast(1.2)' : 'sepia(0.5)' }}></div>
+                             <div className={`absolute inset-0 pointer-events-none z-20 transition-opacity duration-1000 bg-[#8a7a6a] mix-blend-multiply ${developedMode ? 'opacity-30' : 'opacity-0'}`}></div>
+
+                            {/* 静态图片用于照片墙展示，点击后才会被Realize */}
+                            <img src={photo.realImageUrl || photo.imageUrl} className={`w-full h-full object-cover transition-all duration-1000 ${ (photo.realImageUrl && developedMode) ? 'opacity-90 contrast-90 brightness-110 grayscale-[0.3] sepia-[0.6]' : 'opacity-80 contrast-125 grayscale-[0.1] sepia-[0.3]' }`} draggable={false} />
+                            
+                            <div className={`absolute top-2 right-2 z-30 pointer-events-none transition-opacity duration-1000 ${developedMode ? 'opacity-80' : 'opacity-0'}`}>
+                                <p className="digital-font text-[#8a7a6a] text-lg tracking-wider" style={{ textShadow: '0 0 2px #8a7a6a' }}>
+                                    {photo.timestamp}
+                                </p>
+                            </div>
+
+                            {loadingPhotoId === photo.id && (<div className="absolute inset-0 flex items-center justify-center bg-black/50 z-30"><Loader2 className="animate-spin text-white" size={32} /></div>)}
+                            {developedMode && (<div className="absolute bottom-2 right-2 flex gap-2 z-20 opacity-0 group-hover:opacity-100 transition-opacity">{!photo.realImageUrl && (<button className="p-2 bg-black/50 text-white rounded-full hover:bg-purple-600 transition" onClick={(e) => { e.stopPropagation(); onRealizeClick(photo); }} title="显影真实影像"><Wand2 size={16} /></button>)}<button className="p-2 bg-black/50 text-white rounded-full hover:bg-blue-600 transition" onClick={(e) => { e.stopPropagation(); downloadPhoto(photo); }} title="下载照片"><Download size={16} /></button></div>)}
+                        </div>
+                        
+                        <div className={`w-full h-16 flex items-center justify-center px-2 text-[#5a4a3a] transition-opacity duration-1000 ${developedMode ? 'opacity-100' : 'opacity-50'}`}>
+                            {developedMode ? (
+                                <p className="calligraphy-font text-sm w-full text-center truncate opacity-80">{photo.text}</p>
+                            ) : (
+                                <p className="w-full text-center calligraphy-font text-sm text-[#555] opacity-50">...</p>
+                            )}
+                        </div>
+                    </div>
+                ))}
+            </div>
+            <div className="absolute bottom-6 w-full text-center pointer-events-none"><p className="text-white/10 text-xs font-serif tracking-widest">{developedMode ? "点击魔棒显影真实世界 · 点击下载保存" : "点击显影图标进入冲印室"}</p></div>
+        </div>
+    );
+};
+
+const App = () => {
+  const [gameState, setGameState] = useState('startup'); 
+  const [dreamText, setDreamText] = useState('');
+  const [dreamExplanation, setDreamExplanation] = useState(''); 
+  const [gallery, setGallery] = useState([]);
+  const [generatedImageUrl, setGeneratedImageUrl] = useState(null);
+  const [typedText, setTypedText] = useState('');
+  const [isTextFlashing, setIsTextFlashing] = useState(false);
+  
+  // 引入升级版：星际大教堂引擎
+  const { isMuted, toggleMute, rampIntensity } = useCinematicSound();
+
+  const generateExplanation = (text) => {
+      // 深度梦境解析文案库
+      const explanations = [
+          `潜意识档案扫描：对象“${text}”。分析显示，这是一个典型的荣格阴影原型投射。梦境试图通过這些碎片化的意象，弥合你意识与潜意识之間的裂痕。`,
+          `量子态观测报告：检测到关于“${text}”的非线性时间扰动。这或许不是梦，而是另一个平行维度的你在呼救，透过熵增的缝隙传递的信息。`,
+          `神经元连接重构：目标“${text}”。这种景象通常出现在大脑处理存在主义焦虑的深度睡眠期。它象征着对失控的恐惧，以及在混乱中寻找秩序的本能。`,
+          `系统提示：正在解码“${text}”的深层语义。表象之下，是集体潜意识海洋中的一次潮汐。你所见之物，是人类古老记忆在现代语境下的回响。`,
+          `虚构层级分析：关于“${text}”的构建，具有极高的超现实主义特征。这表明你的思维正在尝试打破逻辑的枷锁，探索认知的边界。这是一次精神的逃逸。`
+      ];
+      return explanations[Math.floor(Math.random() * explanations.length)];
+  };
+
+  const generateDreamImage = useCallback(async (textPrompt) => {
+    setGeneratedImageUrl(null);
+    const explanation = generateExplanation(textPrompt);
+    setDreamExplanation(explanation);
+    setGameState('converting');
+    
+    // 生成开始：音乐推向高潮 (8秒爬升到 1.0)
+    if (!isMuted) rampIntensity(1.0, 8);
+
+    // 修改为极度抽象的粒子风格，严禁实体
+    const fullPrompt = `Abstract dreamscape concept: "${textPrompt}". Bio-digital point cloud, glowing neon particles in void, data visualization style, ethereal, non-photorealistic, matrix-like structure, 8k resolution, volumetric lighting, deep depth of field. No solid matter, only light points.`;
+
+    try {
+        const response = await fetch(textToImageApiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ instances: [{ prompt: fullPrompt }], parameters: { "sampleCount": 1 } })
+        });
+        const result = await response.json();
+        const base64Image = result?.predictions?.[0]?.bytesBase64Encoded;
+        if (base64Image) {
+            // 等待2秒后显示结果 (模拟计算)
+            setTimeout(() => {
+                setGeneratedImageUrl(`data:image/png;base64,${base64Image}`);
+                setTimeout(() => {
+                    setGameState('result');
+                    // 结果展示：音乐回落到平静 (4秒降到 0.4)
+                    if (!isMuted) rampIntensity(0.4, 4);
+                }, 1500);
+            }, 2000); 
+        } else { throw new Error("Image generation failed"); }
+    } catch (error) {
+        setTimeout(() => {
+             setGeneratedImageUrl('https://placehold.co/1080x1920/000000/00FFFF?text=Connection+Lost');
+             setDreamExplanation("错误代码：404。连接断开，梦境消散在虚无之中...");
+             setGameState('result');
+             if (!isMuted) rampIntensity(0.2, 2);
+        }, 2000);
+    }
+  }, [isMuted, rampIntensity]);
+
+  const handleRealizePhoto = async (photo) => {
+      try {
+          const base64Data = photo.imageUrl.split(',')[1];
+          const payload = {
+            contents: [{ parts: [{ text: `Transform this abstract particle image into a realistic, high-quality photograph of the same subject concept: "${photo.text}". Photorealistic, cinematic lighting, highly detailed, 8k. Maintain the original composition but make it look like real life.` }, { inlineData: { mimeType: "image/png", data: base64Data } }] }],
+            generationConfig: { responseModalities: ["IMAGE"] }
+          };
+          const response = await fetch(imageToImageApiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+          const result = await response.json();
+          const newBase64 = result.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+          if (newBase64) {
+              setGallery(prevGallery => prevGallery.map(p => p.id === photo.id ? { ...p, realImageUrl: `data:image/png;base64,${newBase64}` } : p));
+          }
+      } catch (e) { console.error("Realize failed", e); }
+  };
+
+  const resetState = () => { 
+      setDreamText(''); 
+      setTypedText(''); 
+      setGeneratedImageUrl(null); 
+      setDreamExplanation(''); 
+      setGameState('journal'); 
+      setIsTextFlashing(false);
+      // 重置回初始平静状态
+      if (!isMuted) rampIntensity(0.2, 3);
+  };
+  
+  const handleTextClick = () => { 
+      if (!dreamText.trim() || isTextFlashing) return; 
+      
+      // 开启星际音效 (如果没有开启)
+      if (isMuted) toggleMute();
+
+      setIsTextFlashing(true); 
+      setTimeout(() => { generateDreamImage(dreamText); }, 300); 
+  };
+  
+  const saveDream = () => { 
+      const now = new Date();
+      const dateStr = now.toLocaleDateString();
+      const timestamp = `'${now.getFullYear().toString().slice(2)} ${String(now.getMonth()+1).padStart(2,'0')} ${String(now.getDate()).padStart(2,'0')} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+      
+      setGallery([{ 
+          id: Date.now(), 
+          text: dreamText, 
+          explanation: dreamExplanation, 
+          date: dateStr, 
+          timestamp: timestamp, 
+          imageUrl: generatedImageUrl 
+      }, ...gallery]); 
+      
+      setGameState('darkroom'); 
+      setDreamText(''); 
+      setTypedText(''); 
+      setGeneratedImageUrl(null); 
+      setDreamExplanation(''); 
+      setIsTextFlashing(false); 
+      
+      // 进入暗房模式，保持稍微神秘的低强度
+      if (!isMuted) rampIntensity(0.1, 2);
+  };
+
+  useEffect(() => { if (gameState !== 'journal') return; const typingSpeed = 50; if (dreamText.length > typedText.length) { const timeout = setTimeout(() => { setTypedText(dreamText.substring(0, typedText.length + 1)); }, typingSpeed); return () => clearTimeout(timeout); } else if (dreamText.length < typedText.length) { setTypedText(dreamText); } }, [dreamText, typedText, gameState]);
+
+  return (
+    <div className="w-full h-screen max-w-md mx-auto overflow-hidden relative font-sans select-none bg-black">
+      <SoundController isMuted={isMuted} toggleMute={toggleMute} />
+
+      {gameState === 'startup' && <StartupScreen setGameState={setGameState} />}
+      {gameState === 'journal' && <JournalScreen dreamText={dreamText} setDreamText={setDreamText} typedText={typedText} setTypedText={setTypedText} handleTextClick={handleTextClick} isTextFlashing={isTextFlashing} />}
+      {(gameState === 'converting' || gameState === 'result') && <AnimationScreen gameState={gameState} generatedImageUrl={generatedImageUrl} dreamExplanation={dreamExplanation} resetState={resetState} saveDream={saveDream} />}
+      {gameState === 'darkroom' && <DarkroomScreen gallery={gallery} setGallery={setGallery} setGameState={setGameState} handleRealizePhoto={handleRealizePhoto} />}
+    </div>
+  );
+};
+
+export default App;
